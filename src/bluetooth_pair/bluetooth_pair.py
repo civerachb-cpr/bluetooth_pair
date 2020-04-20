@@ -27,13 +27,23 @@ import rospy
 import dbus
 import dbus.service
 import dbus.mainloop.glib
+import bluetooth
+import threading
+
 from bluetooth_pair.msg import BluetoothDevice, BluetoothDevices
 from bluetooth_pair.srv import PairDevice, PairDeviceResponse, SearchDevices, SearchDevicesResponse
 
+SERVICE_NAME = "org.bluez"
+AGENT_IFACE = SERVICE_NAME + '.Agent1'
+ADAPTER_IFACE = SERVICE_NAME + ".Adapter1"
+DEVICE_IFACE = SERVICE_NAME + ".Device1"
 
 class Agent(dbus.service.Object):
     pass
 
+
+# see: https://github.com/Douglas6/blueplayer/blob/master/blueplayer.py
+# see: https://stackoverflow.com/questions/14262315/list-nearby-discoverable-bluetooth-devices-including-already-paired-in-python
 
 class BluetoothPairNode(object):
     def __init__(self, node_name='bluetooth_pair'):
@@ -49,20 +59,17 @@ class BluetoothPairNode(object):
         self.bus = dbus.SystemBus()
         self.dbus_path = '/ros/bluetooth_pair'
         self.agent = Agent(self.bus, self.dbus_path)
-        self.manager = dbus.Interface(self.bus.get_object('org.bluez', '/'),
-                                      'org.bluez.Manager')
-        self.adapter = dbus.Interface(self.bus.get_object('org.bluez', self.manager.DefaultAdapter()),
-                                      'org.bluez.Adapter')
-
-        # Add signal receivers for discovery
-        self.bus.add_signal_receiver(self.device_found,
-                                     dbus_interface='org.bluez.Adapter',
-                                     signal_name='DeviceFound')
-        self.bus.add_signal_receiver(self.property_changed,
-                                     dbus_interface='org.bluez.Adapter',
-                                     signal_name='PropertyChanged')
+        self.manager = self.proxyobj(self.bus, '/', 'org.freedesktop.DBus.ObjectManager')
+        objects = self.manager.GetManagedObjects()
+        for path, ifaces in objects.iteritems():
+            adapter = ifaces.get(ADAPTER_IFACE)
+            if adapter is None:
+                continue
+            obj = self.bus.get_object('org.bluez', path)
+            self.adapter = dbus.Interface(obj, ADAPTER_IFACE)
 
         # Configure ROS services
+        self.discovery_in_progress = False
         self.request_scan_service = rospy.Service('search_devices',
                                                   SearchDevices, self.search_devices)
         self.pair_service = rospy.Service('pair_device',
@@ -73,6 +80,19 @@ class BluetoothPairNode(object):
         # Configure ROS publishers
         self.list_devices_pub = rospy.Publisher('discovered_devices', BluetoothDevices, queue_size=1, latch=True)
         self.list_paired_pub = rospy.Publisher('paired_devices', BluetoothDevices, queue_size=1, latch=True)
+
+    def proxyobj(self, bus, path, interface):
+        obj = bus.get_object('org.bluez', path)
+        return dbus.Interface(obj, interface)
+
+    def filter_by_interface(self, objects, interface_name):
+        result = []
+        for path in objects.keys():
+            interfaces = objects[path]
+            for interface in interfaces.keys():
+                if interface == interface_name:
+                    result.append(path)
+        return result
 
     def run(self):
         rospy.Timer(rospy.Duration(10), self.pub_paired_devices)
@@ -87,23 +107,65 @@ class BluetoothPairNode(object):
         rospy.rostime.wallsleep(0.5)
 
     def pub_paired_devices(self, event):
+        objects = self.manager.GetManagedObjects()
+        devices = self.filter_by_interface(objects, DEVICE_IFACE)
         paired = BluetoothDevices()
-        for path in self.adapter.ListDevices():
-            device = dbus.Interface(self.bus.get_object('org.bluez', path),
-                                    'org.bluez.Device')
-            properties = device.GetProperties()
-            paired.devices.append(BluetoothDevice(mac_address=str(properties['Address']),
-                                                  device_name=str(properties['Name'])))
+        for device in devices:
+            obj = self.proxyobj(self.bus, device, 'org.freedesktop.DBus.Properties')
+            props = obj.GetAll(DEVICE_IFACE, dbus_interface='org.freedesktop.DBus.Properties')
+
+            if 'Address' in props:
+                mac_address = str(props['Address'])
+            else:
+                mac_address = None
+
+            if 'Name' in props:
+                device_name = str(props['Name'])
+            else:
+                device_name = 'Unnamed Device'
+
+            if 'Paired' in props:
+                is_paired = bool(props['Paired'])
+            else:
+                is_paired = False
+
+            if is_paired:
+                paired.devices.append(BluetoothDevice(mac_address=mac_address, device_name=device_name))
+                #rospy.loginfo('Paired Device "{0}" [{1}]'.format(device_name, mac_address))
 
         self.list_paired_pub.publish(paired)
 
     # ROS Service calls
     def search_devices(self, req):
-        self.found_devices = dict()  # New search requested, clear old results.
-        self.search_filter = req.device_name
-        rospy.loginfo('Starting discovery')
-        self.adapter.StartDiscovery()
+        "Create a background thread to discover nearby objects"
+        if not self.discovery_in_progress:
+            self.discovery_in_progress = True
+            self.found_devices = dict()  # New search requested, clear old results.
+            self.search_filter = req.device_name
+            worker = threading.Thread(target=self.__discover_in_background)
+            worker.start()
+        else:
+            rospy.logwarn("Bluetooth discovery scan already in progress; please wait for the first one to finish before starting a new one")
         return SearchDevicesResponse()
+
+    def __discover_in_background(self):
+        "The background worker thread invoked by search_devices(self, req)"
+        rospy.loginfo('Starting Bluetooth discovery scan w/ filter "{0}"'.format(self.search_filter))
+        devices = bluetooth.discover_devices(lookup_names=True)
+        n_devices=0
+        for device in devices:
+            mac_address = device[0]
+            device_name = device[1]
+
+            if len(self.search_filter) == 0 or self.search_filter.lower() in device_name.lower():
+                rospy.loginfo('Discovered device "{0}" [{1}] matching requested filter'.format(device_name, mac_address))
+                bt_dev = BluetoothDevice(mac_address=mac_address, device_name=device_name)
+                self.found_devices[mac_address] = bt_dev
+                self.list_devices_pub.publish([v for (k, v) in self.found_devices.items()])
+                n_devices = n_devices+1
+
+        rospy.loginfo("Bluetooth discovery scan complete. Found {0} devices matching filter".format(n_devices))
+        self.discovery_in_progress = False
 
     def pair_device(self, req):
         # Remove an already paired device, as the pair key may be
@@ -131,7 +193,7 @@ class BluetoothPairNode(object):
             rospy.loginfo('Trusting %s', req.device_mac)
             path = self.adapter.FindDevice(req.device_mac)
             device = dbus.Interface(self.bus.get_object('org.bluez', path),
-                                    'org.bluez.Device')
+                                    ADAPTER_IFACE)
             device.SetProperty('Trusted', dbus.Boolean(1))
             return PairDeviceResponse(True)
         elif self.pair_error:
@@ -161,19 +223,3 @@ class BluetoothPairNode(object):
         else:
             rospy.logerr('Pairing failure: %s', error)
             self.pair_error = True
-
-    def device_found(self, address, properties):
-        if 'Name' in properties.keys():
-            rospy.loginfo('Found %s:%s', properties['Name'], properties['Address'])
-            if self.search_filter in properties['Name']:
-                self.found_devices[address] = BluetoothDevice(mac_address=str(properties['Address']),
-                                                              device_name=str(properties['Name']))
-            elif not self.search_filter:
-                self.found_devices[address] = BluetoothDevice(mac_address=str(properties['Address']),
-                                                              device_name=str(properties['Name']))
-            self.list_devices_pub.publish([v for (k, v) in self.found_devices.items()])
-
-    def property_changed(self, name, value):
-        if (name == 'Discovering' and not value):
-            self.adapter.StopDiscovery()
-            rospy.loginfo('Discovery Complete')
