@@ -41,10 +41,6 @@ DEVICE_IFACE = SERVICE_NAME + ".Device1"
 class Agent(dbus.service.Object):
     pass
 
-
-# see: https://github.com/Douglas6/blueplayer/blob/master/blueplayer.py
-# see: https://stackoverflow.com/questions/14262315/list-nearby-discoverable-bluetooth-devices-including-already-paired-in-python
-
 class BluetoothPairNode(object):
     def __init__(self, node_name='bluetooth_pair'):
         rospy.init_node(node_name)
@@ -82,10 +78,14 @@ class BluetoothPairNode(object):
         self.list_paired_pub = rospy.Publisher('paired_devices', BluetoothDevices, queue_size=1, latch=True)
 
     def proxyobj(self, bus, path, interface):
+        # see: https://github.com/Douglas6/blueplayer/blob/master/blueplayer.py
+        # see: https://stackoverflow.com/questions/14262315/list-nearby-discoverable-bluetooth-devices-including-already-paired-in-python
         obj = bus.get_object('org.bluez', path)
         return dbus.Interface(obj, interface)
 
     def filter_by_interface(self, objects, interface_name):
+        # see: https://github.com/Douglas6/blueplayer/blob/master/blueplayer.py
+        # see: https://stackoverflow.com/questions/14262315/list-nearby-discoverable-bluetooth-devices-including-already-paired-in-python
         result = []
         for path in objects.keys():
             interfaces = objects[path]
@@ -95,6 +95,7 @@ class BluetoothPairNode(object):
         return result
 
     def run(self):
+        "The main loop for the ROS node"
         rospy.Timer(rospy.Duration(10), self.pub_paired_devices)
         rospy.loginfo('Starting bluetooth_pair')
         while not rospy.is_shutdown():
@@ -107,6 +108,7 @@ class BluetoothPairNode(object):
         rospy.rostime.wallsleep(0.5)
 
     def pub_paired_devices(self, event):
+        "Publishes the currently-paired devices to the /paired_devices ROS topic"
         objects = self.manager.GetManagedObjects()
         devices = self.filter_by_interface(objects, DEVICE_IFACE)
         paired = BluetoothDevices()
